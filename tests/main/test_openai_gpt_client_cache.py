@@ -2,8 +2,13 @@
 Tests for OpenAIGPT client caching functionality.
 """
 
+import threading
+import time
+from typing import Any
+
 import httpx
 import pytest
+from openai import AsyncOpenAI, OpenAI
 
 import langroid.language_models.client_cache as client_cache_module
 from langroid.language_models.client_cache import (
@@ -165,6 +170,193 @@ class TestOpenAIGPTClientCache:
 
         assert client1 is client2
         assert len(created_clients) == 1
+
+    @pytest.mark.parametrize(
+        "getter,httpx_attr,openai_cls,api_key",
+        [
+            (get_openai_client, "Client", OpenAI, "test-key-race-sync"),
+            (
+                get_async_openai_client,
+                "AsyncClient",
+                AsyncOpenAI,
+                "test-key-race-async",
+            ),
+        ],
+        ids=["sync", "async"],
+    )
+    def test_concurrent_misses_construct_httpx_client_once(
+        self, monkeypatch, getter, httpx_attr, openai_cls, api_key
+    ):
+        """Racing identical misses build exactly one transport per entry.
+
+        Miss construction is serialized under the cache lock, so threads
+        racing on the same argument tuple must share a single client and
+        construct at most one httpx transport.
+        """
+        created_http_clients: list[Any] = []
+        real_http_client_cls = getattr(httpx, httpx_attr)
+        n_threads = 8
+        barrier = threading.Barrier(n_threads)
+
+        class BlockingTrackingHttpClient(real_http_client_cls):
+            def __init__(self, *args, **kwargs):
+                created_http_clients.append(self)
+                # Stay inside the constructor briefly so unserialized
+                # construction by racing threads would be detected.
+                time.sleep(0.15)
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, httpx_attr, BlockingTrackingHttpClient)
+
+        results: list[Any] = []
+        errors: list[BaseException] = []
+
+        def get_client():
+            try:
+                barrier.wait(timeout=10)
+                results.append(
+                    getter(
+                        api_key=api_key,
+                        http_client_config={"timeout": 1.0},
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=get_client, daemon=True) for _ in range(n_threads)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(results) == n_threads
+        assert all(client is results[0] for client in results)
+        assert isinstance(results[0], openai_cls)
+        assert len(created_http_clients) == 1
+
+    @pytest.mark.parametrize(
+        "getter,httpx_attr,openai_cls,api_key",
+        [
+            (get_openai_client, "Client", OpenAI, "test-key-flaky-sync"),
+            (
+                get_async_openai_client,
+                "AsyncClient",
+                AsyncOpenAI,
+                "test-key-flaky-async",
+            ),
+        ],
+        ids=["sync", "async"],
+    )
+    def test_httpx_construction_failure_propagates_and_is_not_cached(
+        self, monkeypatch, getter, httpx_attr, openai_cls, api_key
+    ):
+        """Failed transport construction propagates and caches nothing.
+
+        The construction error must reach the caller, the cache lock must
+        be released, and no failed/partial client may be cached: a retry
+        with identical arguments constructs a fresh client.
+        """
+        construction_calls: list[Any] = []
+        real_http_client_cls = getattr(httpx, httpx_attr)
+
+        class FlakyHttpClient(real_http_client_cls):
+            def __init__(self, *args, **kwargs):
+                construction_calls.append(self)
+                if len(construction_calls) == 1:
+                    raise RuntimeError("transport construction failed")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, httpx_attr, FlakyHttpClient)
+
+        def call_getter():
+            return getter(
+                api_key=api_key,
+                http_client_config={"timeout": 1.0},
+            )
+
+        with pytest.raises(RuntimeError, match="transport construction failed"):
+            call_getter()
+        assert len(construction_calls) == 1
+
+        # Retry on another thread: it must not deadlock on a leaked cache
+        # lock (an RLock re-acquired from this thread would mask a leak),
+        # and it must not observe a cached failed/partial client.
+        retry_results: list[Any] = []
+        retry_errors: list[BaseException] = []
+
+        def retry():
+            try:
+                retry_results.append(call_getter())
+            except BaseException as exc:
+                retry_errors.append(exc)
+
+        thread = threading.Thread(target=retry, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive(), "cache lock was not released"
+        assert retry_errors == []
+        assert len(retry_results) == 1
+        client = retry_results[0]
+        assert isinstance(client, openai_cls)
+        assert len(construction_calls) == 2
+
+        # A further identical call is a plain cache hit: same client,
+        # and no additional transport construction.
+        assert call_getter() is client
+        assert len(construction_calls) == 2
+
+    @pytest.mark.parametrize(
+        "getter,httpx_attr,api_key",
+        [
+            (get_openai_client, "Client", "test-key-configs-sync"),
+            (
+                get_async_openai_client,
+                "AsyncClient",
+                "test-key-configs-async",
+            ),
+        ],
+        ids=["sync", "async"],
+    )
+    def test_distinct_http_client_configs_get_distinct_clients(
+        self, monkeypatch, getter, httpx_attr, api_key
+    ):
+        """Same API key but different http_client_config: no client reuse.
+
+        http_client_config is part of the cache key, so each distinct
+        config must get its own client and its own httpx transport.
+        """
+        created_http_clients: list[Any] = []
+        real_http_client_cls = getattr(httpx, httpx_attr)
+
+        class TrackingHttpClient(real_http_client_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_http_clients.append(self)
+
+        monkeypatch.setattr(httpx, httpx_attr, TrackingHttpClient)
+
+        client1 = getter(
+            api_key=api_key,
+            http_client_config={"timeout": 1.0},
+        )
+        client2 = getter(
+            api_key=api_key,
+            http_client_config={"timeout": 2.0},
+        )
+
+        assert client1 is not client2
+        assert len(created_http_clients) == 2
+
+        # Each distinct config keeps its own cache entry: repeat calls
+        # are hits and construct no further transports.
+        assert getter(api_key=api_key, http_client_config={"timeout": 1.0}) is client1
+        assert getter(api_key=api_key, http_client_config={"timeout": 2.0}) is client2
+        assert len(created_http_clients) == 2
 
     def test_prune_cache_negative_max_age_raises(self):
         """Test that negative max_age_seconds raises ValueError."""
