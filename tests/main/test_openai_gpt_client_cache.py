@@ -2,6 +2,7 @@
 Tests for OpenAIGPT client caching functionality.
 """
 
+import sys
 import threading
 import time
 from typing import Any
@@ -309,6 +310,61 @@ class TestOpenAIGPTClientCache:
         # and no additional transport construction.
         assert call_getter() is client
         assert len(construction_calls) == 2
+
+    @pytest.mark.parametrize(
+        "getter,openai_cls,api_key",
+        [
+            (get_openai_client, OpenAI, "test-key-no-httpx-sync"),
+            (
+                get_async_openai_client,
+                AsyncOpenAI,
+                "test-key-no-httpx-async",
+            ),
+        ],
+        ids=["sync", "async"],
+    )
+    def test_missing_httpx_raises_value_error_and_is_not_cached(
+        self, getter, openai_cls, api_key
+    ):
+        """Unimportable httpx plus http_client_config raises ValueError.
+
+        When ``from httpx import Client`` / ``from httpx import
+        AsyncClient`` fails with ImportError, the getter must raise the
+        documented ValueError, cache nothing, and construct/cache
+        normally once httpx is importable again.
+        """
+
+        def call_getter():
+            return getter(
+                api_key=api_key,
+                http_client_config={"timeout": 1.0},
+            )
+
+        real_httpx = sys.modules["httpx"]
+        # Simulate an environment without httpx: a None entry in
+        # sys.modules makes ``from httpx import ...`` raise ImportError.
+        sys.modules["httpx"] = None  # type: ignore[assignment]
+        try:
+            with pytest.raises(ValueError) as excinfo:
+                call_getter()
+        finally:
+            sys.modules["httpx"] = real_httpx
+
+        assert str(excinfo.value) == (
+            "httpx is required to use http_client_config. "
+            "Install it with: pip install httpx"
+        )
+        # The ValueError must come from the ImportError branch.
+        assert isinstance(excinfo.value.__context__, ImportError)
+        # The failed call must not leave a cache entry behind.
+        assert len(client_cache_module._client_cache) == 0
+
+        # With httpx importable again, the identical call constructs
+        # and caches a client normally.
+        client = call_getter()
+        assert isinstance(client, openai_cls)
+        assert len(client_cache_module._client_cache) == 1
+        assert call_getter() is client
 
     @pytest.mark.parametrize(
         "getter,httpx_attr,api_key",
